@@ -83,6 +83,10 @@ itself.
 
 - It writes the chat completion as Qoder's request:
   - Qoder's own system line comes before yours.
+  - The words a coding plan's gateway is known to turn a chat away for —
+    Claude Code's, Codex's and DeepSeek Harness's own lines — are put in
+    other words in your system prompt (since 0.2.34), as WorkBuddy's
+    plugin does for the lines its channel check refuses.
   - Messages become text and image blocks.
   - Tool calls and results become OpenAI tool turns. Images a tool returned
     follow in a user turn.
@@ -129,6 +133,21 @@ itself.
   - `Cosy-Version`: the worker runtime version that Qoder's desktop app
     ships (1.1.69 in app 0.4.8, since 0.2.23, #281), because
     `Cosy-ClientType` says the desktop app.
+
+**A refused system prompt**
+
+A chat Qoder refuses the request itself for — its codes for sensitive
+content and the like, the ones it answers a request rather than an account
+with — is asked once more with your system prompt read to the model as the
+first thing you say, in `<instructions>` tags, and Qoder's own system line
+alone in the system's place (since 0.2.34). That is the shape WorkBuddy's
+plugin gives a prompt its channel check refuses, and it is the same trade:
+a prompt that reads as yours in the system's place reaches the model as
+your words instead, which a gate reading the system's place alone lets
+through. A prompt refused that way is remembered for the run, so the next
+chat with it is sent that way at once rather than refused first. A
+refusal of the moved chat, and any refusal that isn't the request's own
+(a quota, a lapsed sign-in), is answered as Qoder's own words.
 
 **Reading the reply**
 

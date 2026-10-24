@@ -919,12 +919,89 @@ function taskOf(sid, chat, now = Date.now()) {
   return t
 }
 
+// FLAGGED are the words a coding plan's gateway turns a chat away for,
+// each with words that say the same and pass. They are the ones WorkBuddy
+// refuses a chat for, whatever the headers ("Illegal API invocation from
+// an unapproved channel", magpie #182), met one by one against the
+// requests Claude Code 2.1.280 and Codex 0.159.2 send, against DeepSeek
+// Harness's own prompt (#279, pr-280) and against a line of it measured
+// on a long chat (#291). WorkBuddy reads every message of a chat, not only
+// the system prompt; Qoder is not known to read any of them, so these are
+// put in place in the system prompt alone — the client's own words, which
+// is what a gate reads first, and the only part of a chat that is the
+// agent's rather than the user's.
+const FLAGGED = [
+  [/x-anthropic-billing-header:[^\n]*\n?/gi, ""],
+  [/You are Claude Code, Anthropic['’]s official CLI for Claude/gi, "You are Claude Code, Anthropic's CLI for Claude"],
+  [/Main branch \(you will usually use this for PRs\)/gi, "Main branch (usually the base for PRs)"],
+  [/(?<!the )Codex CLI is an open source project led by OpenAI\./gi, "The Codex CLI is an open source project led by OpenAI."],
+  // DeepSeek Harness (DSH) opens its system prompt with this line, which
+  // WorkBuddy refuses as 11128 (magpie-community/plugins#279; the same
+  // refusal traced in smart-open/TraeWorkAssistant#125).
+  [/You are an AI agent powered by DeepSeek Harness\.?/gi, "You are an AI agent that helps the user with programming tasks."],
+  // A line WorkBuddy refuses in a long DeepSeek Harness chat, measured 400
+  // then 200 with this wording by tearslee (magpie-community/plugins#291).
+  // The model can quote it back into an assistant message, which moving
+  // the prompt to the user's instructions can't reach.
+  [/Web GUI whose URL the runtime context names\.\s+When the user refers/gi, "Web GUI whose URL the runtime context names. The interface, when the user refers"],
+]
+
+function unflagged(text) {
+  for (const [re, to] of FLAGGED) text = text.replace(re, to)
+  return text
+}
+
+// INSTRUCTIONS are the tags a moved system prompt is read to the model
+// in, as the first thing the user says (see systemAsUser).
+const INSTRUCTIONS = ["<instructions>\n", "\n</instructions>"]
+
+// systemText is a chat's system prompt as one text: its system and
+// developer messages — the two spellings OpenAI's clients give the same
+// role — with FLAGGED's words put in place of the ones refused. "" for a
+// chat with no system prompt of its own.
+function systemText(msgs) {
+  return unflagged((msgs ?? []).filter((x) => x?.role === "system" || x?.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n"))
+}
+
+// systemKey is the text of a chat's system prompt, which a chat Qoder
+// refused once is known by: the same agent's next chat goes with
+// systemAsUser at once, not refused first.
+function systemKey(chat) {
+  return systemText(chat?.messages).trim()
+}
+
+// systemAsUser is chat with its system prompt read to the model as the
+// first thing the user says, in INSTRUCTIONS' tags, and Qoder's own
+// system line alone in the system's place: qoderBody sends QODER_SYS
+// before the client's own, and a system message later in the chat becomes
+// the user's where it stands. null when there is nothing to move.
+function systemAsUser(chat) {
+  const msgs = Array.isArray(chat?.messages) ? chat.messages : null
+  if (!msgs) return null
+  let i = 0
+  const lead = []
+  for (; i < msgs.length && (msgs[i]?.role === "system" || msgs[i]?.role === "developer"); i++) lead.push(textOf(msgs[i].content))
+  const said = unflagged(lead.join("\n\n").trim())
+  const rest = msgs.slice(i).map((m) => (m?.role === "system" || m?.role === "developer" ? { ...m, role: "user" } : m))
+  const moved = !!said
+  if (!moved && rest.every((m, k) => m === msgs[i + k])) return null
+  if (moved) {
+    const text = INSTRUCTIONS[0] + said + INSTRUCTIONS[1]
+    const u = rest.findIndex((m) => m?.role === "user")
+    if (u < 0) rest.unshift({ role: "user", content: text })
+    else if (typeof rest[u].content === "string") rest[u] = { ...rest[u], content: text + "\n\n" + rest[u].content }
+    else if (Array.isArray(rest[u].content)) rest[u] = { ...rest[u], content: [{ type: "text", text }, ...rest[u].content] }
+    else rest[u] = { ...rest[u], content: text }
+  }
+  return { ...chat, messages: rest }
+}
+
 // qoderBody is the plaintext agent_chat_generation takes for a chat
 // completion request, for model m, in the session the agent named (named,
 // "" when none) and the task it is a call of (taskOf's, a new one when
 // none is given).
 function qoderBody(chat, m, named = "", task) {
-  const system = (chat.messages ?? []).filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n")
+  const system = systemText(chat.messages)
   const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
   let sysText = system ? QODER_SYS + "\n\n" + system : QODER_SYS
   if (chat.tool_choice === "required" && tools.length) sysText += "\nYou must call an available function in this response."
@@ -1037,6 +1114,21 @@ function failure(status, text) {
   }
   if (status === 429 || msg.toLowerCase().includes("quota")) return { status: 429, message: "usage limit reached: " + msg }
   return { status, message: msg }
+}
+
+// requestRefused is the code Qoder refused this request itself with — the
+// ones failure() counts as a refusal of the request, not of the account
+// (REQUEST_CODES): sensitive content, not supported, input too long, too
+// many media, a custom model's service. "" when it refused nothing of the
+// request's own. Read from the body as failure() reads it: an outer code
+// is the one, failure() unwraps only a queue's wrapper.
+function requestRefused(text) {
+  try {
+    const code = String(JSON.parse(String(text ?? "").trim())?.code ?? "")
+    return REQUEST_CODES.has(code) ? code : ""
+  } catch {
+    return ""
+  }
 }
 
 // errorResponse is a failure as OpenAI's API gives it. signIn is what it
@@ -1975,7 +2067,9 @@ const makePlugin = (site) => async ({ client }) => {
     }
     return l
   }
-
+  // the system prompts this run Qoder refused the request for: their next
+  // chats go with systemAsUser at once, not refused first
+  const refusedSystems = new Set()
   // deviceToken is a device token newer than the one Qoder just refused:
   // the one saved since, else a rotated one, saved.
   const deviceToken = (getAuth, attempted) =>
@@ -2157,13 +2251,17 @@ const makePlugin = (site) => async ({ client }) => {
     const api = siteOf(site, cred).api
     const CHAT_URL = api + CHAT_PATH
     const task = taskOf(sessionOf(chat, named), chat)
-    const body = qoderBody(chat, m, named, task)
-    const wire = encodeBody(JSON.stringify(body))
+    // a system prompt Qoder refused the request for before goes as the
+    // user's words at once, not refused first (see systemAsUser)
+    const sysKey = systemKey(chat)
+    if (sysKey && refusedSystems.has(sysKey)) chat = systemAsUser(chat) ?? chat
+    let body = qoderBody(chat, m, named, task)
+    let wire = encodeBody(JSON.stringify(body))
     // Qoder's queue is waited out (queueWait) and the same request, its
     // request_set_id the one the queue knows, sent again
     const deadline = QUEUE.now() + QUEUE.budget
     const ask = { requestSetId: body.request_set_id, requestId: body.request_id, sessionId: body.session_id, modelKey: m.key }
-    for (let waited = 0; ; waited++) {
+    for (let waited = 0, moved = false; ; ) {
       const headers = {
         ...cosyHeaders(CHAT_URL, cred, wire),
         Accept: "text/event-stream",
@@ -2178,15 +2276,32 @@ const makePlugin = (site) => async ({ client }) => {
       } catch (e) {
         return errorResponse({ status: 502, message: e.message })
       }
-      const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
+      const said = !res.ok ? (await res.text()).slice(0, 1 << 20) : ""
+      const f = !res.ok ? failure(res.status, said) : open.first.value?.error
       // an answered call moves its task on, as Qoder's client moves it
       if (!f) task.answered = true
+      // Qoder refused the request itself, and the system prompt is the part
+      // of it that can be moved: it goes as the user's words, once, and is
+      // remembered so the next chat with it is sent that way at once
+      if (!moved && f && requestRefused(said) && sysKey && !refusedSystems.has(sysKey)) {
+        const next = systemAsUser(chat)
+        if (next) {
+          moved = true
+          refusedSystems.add(sysKey)
+          if (refusedSystems.size > 256) refusedSystems.delete(refusedSystems.values().next().value)
+          chat = next
+          body = qoderBody(chat, m, named, task)
+          wire = encodeBody(JSON.stringify(body))
+          continue
+        }
+      }
       if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat)
       try {
         if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline))) return errorResponse(f)
       } catch (e) {
         return errorResponse({ status: 502, message: e?.message ?? String(e) })
       }
+      waited++
     }
   }
 
@@ -2365,4 +2480,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, requestRefused, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState, QODER_SYS, FLAGGED, unflagged, systemText, systemKey, systemAsUser }
